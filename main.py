@@ -82,6 +82,9 @@ def train(epoch):
     train_loss = 0.
     train_error = 0.
     for batch_idx, (data, label) in enumerate(train_loader):
+        print(data.shape)
+        print(label)
+        print("--x--"*25)
         bag_label = label[0]
         if args.cuda:
             data, bag_label = data.cuda(), bag_label.cuda()

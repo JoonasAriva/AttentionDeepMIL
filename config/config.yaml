@@ -1,0 +1,22 @@
+hydra:
+  run:
+    dir: results/${hydra.job.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+project: MIL_TUH_EXP
+
+training:
+  epochs: 75
+  learning_rate: 1e-4
+  weight_decay: 10e-5
+  seed: 1
+
+
+model:
+  classes: 2
+  name: resnet18
+  pretrained_medicalnet: False
+  pretrained_imagenet: True
+
+take_every_nth_slice: 4
+interpolation: False
+check: False

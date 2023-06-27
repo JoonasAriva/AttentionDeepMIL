@@ -1,0 +1,15 @@
+hydra:
+  run:
+    dir: results/${hydra.job.name}/${model.name}/${data}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+project: tuh_CAMS
+
+model:
+  name: resnet18
+  classes: 2
+  pytorch_implementation: True
+
+data: train
+
+
+
