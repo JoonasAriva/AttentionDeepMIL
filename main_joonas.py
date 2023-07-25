@@ -1,22 +1,21 @@
 from __future__ import print_function
 
-import numpy as np
-import os
-import argparse
-import torch
-import torch.utils.data as data_utils
-import torch.optim as optim
-from torch.autograd import Variable
-from torchsummary import summary
-from dataloader import MnistBags
-from model import Attention, GatedAttention, ResNet18Attention
-from tqdm import tqdm
-import sys
-import wandb
 import logging
-from omegaconf import DictConfig, OmegaConf
-import hydra
+import os
+import sys
 from pathlib import Path
+
+import hydra
+import numpy as np
+import torch
+import torch.optim as optim
+import torch.utils.data as data_utils
+import wandb
+from monai.transforms import *
+from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
+
+from model import Attention, GatedAttention, ResNet18Attention
 
 sys.path.append('/gpfs/space/home/joonas97/MIL/AttentionDeepMIL')
 from dataloader_TUH import TUH_full_scan_dataset
@@ -26,8 +25,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 dir_checkpoint = Path('./checkpoints/')
 
-
-# os.environ["WANDB_ DISABLE_SERVICE"] =True
 
 def train(model, optimizer, train_loader, epoch, loss_function, check=False):
     model.train()
@@ -39,12 +36,10 @@ def train(model, optimizer, train_loader, epoch, loss_function, check=False):
         tepoch.set_description(f"Epoch {epoch}")
         step += 1
 
-        _, c, x, y, h = data.shape
-        data = torch.reshape(data, (1, h, c, x, y))
-
+        #_, c, x, y, h = data.shape
+        #data = torch.reshape(data, (1, h, c, x, y))
+        data = torch.permute(data, (0, 4, 1, 2, 3))
         data, bag_label = data.cuda(), bag_label.cuda()
-
-        # data, bag_label = Variable(data), Variable(bag_label)
 
         # reset gradients
         optimizer.zero_grad()
@@ -54,11 +49,7 @@ def train(model, optimizer, train_loader, epoch, loss_function, check=False):
             loss = loss_function(Y_prob, bag_label.float())
             train_loss += loss.item()
             error = model.calculate_classification_error(bag_label, Y_hat)
-        # print("correct_label:", bag_label)
-        # print("prediceted probability: ", Y_prob)
-        # print("rounded prediction: ", Y_hat)
-        # print("LOSS: ", loss.item())
-        # print("ERROR: ", error)}
+
         train_error += error
         # backward pass
         loss.backward()
@@ -87,21 +78,17 @@ def validation(model, test_loader, loss_function, epoch, val_dict, check=False):
         tepoch.set_description(f"Validation of epoch {epoch}")
         step += 1
 
-        _, c, x, y, h = data.shape
-        data = torch.reshape(data, (1, h, c, x, y))
+        #_, c, x, y, h = data.shape # should permute to --> (1, h, c, x, y)
+        data = torch.permute(data, (0, 4, 1, 2, 3))
         data, bag_label = data.cuda(), bag_label.cuda()
         with torch.no_grad(), torch.cuda.amp.autocast():
             Y_prob, predicted_label, attention_weights = model.forward(data)
-            # print("val correct_label:", bag_label)
-            # print("val prediceted probability: ", Y_prob)
-            # print("val rounded prediction: ", predicted_label)
-            # loss = model.calculate_objective(bag_label, Y_prob)
+
             loss = loss_function(Y_prob, bag_label.float())
             test_loss += loss.item()  # .data[0]
             error = model.calculate_classification_error(bag_label, predicted_label)
             test_error += error
-        # print("fsdfsdfsdfsdfsdfsd")
-        # print(predicted_label.as_tensor().cpu())
+
         if str(step) in val_dict:
             val_dict[str(step)][0].append(int(predicted_label.as_tensor().cpu().item()))
         else:
@@ -133,10 +120,21 @@ def main(cfg: DictConfig):
     print('Load Train and Test Set')
     loader_kwargs = {'num_workers': 1, 'pin_memory': True} if torch.cuda.is_available() else {}
 
-    train_dataset = TUH_full_scan_dataset(dataset_type="train", only_every_nth_slice=cfg.take_every_nth_slice,
-                                          interpolation=cfg.interpolation, as_rgb=True)
-    test_dataset = TUH_full_scan_dataset(dataset_type="test", only_every_nth_slice=cfg.take_every_nth_slice,
-                                         interpolation=cfg.interpolation, as_rgb=True)
+    transforms_train = Compose(
+        [
+            RandRotate(range_x=1, prob=1),
+            RandGaussianNoise(prob=0.5, mean=0, std=0.2),
+            RandAffine(prob=0.5, scale_range=(-0.1, 0.1), translate_range=(-50, 50),
+                       padding_mode="border")
+        ])
+
+    train_dataset = TUH_full_scan_dataset(dataset_type="train", only_every_nth_slice=cfg.data.take_every_nth_slice,
+                                          interpolation=cfg.data.interpolation, as_rgb=True,
+                                          sample_shifting=cfg.data.sample_shifting,
+                                          augmentations=transforms_train if cfg.data.data_augmentations is True else None,
+                                          plane = cfg.data.plane)
+    test_dataset = TUH_full_scan_dataset(dataset_type="test", only_every_nth_slice=cfg.data.take_every_nth_slice,
+                                         interpolation=cfg.data.interpolation, as_rgb=True, plane = cfg.data.plane)
     train_loader = data_utils.DataLoader(train_dataset,
                                          batch_size=1,
                                          shuffle=True,
@@ -150,15 +148,23 @@ def main(cfg: DictConfig):
     logging.info('Init Model')
 
     if cfg.model.name == 'resnet18':
-        model = ResNet18Attention()
+        model = ResNet18Attention(
+            neighbour_range=cfg.model.neighbour_range)
         # Let's freeze the backbone
         # model.backbone.requires_grad_(False)
     elif cfg.model.name == 'attention':
         model = Attention()
     elif cfg.model.name == 'gated_attention':
         model = GatedAttention()
+
+        # if you need to continue training
+    if "checkpoint" in cfg.keys():
+        print("Using checkpoint", cfg.checkpoint)
+        model.load_state_dict(torch.load(os.path.join('/gpfs/space/home/joonas97/MIL/AttentionDeepMIL/', cfg.checkpoint)))
     if torch.cuda.is_available():
         model.cuda()
+
+
     # summary(model, (3, 512, 512))
     optimizer = optim.Adam(model.parameters(), lr=cfg.training.learning_rate, betas=(0.9, 0.999),
                            weight_decay=cfg.training.weight_decay)

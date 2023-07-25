@@ -1,12 +1,12 @@
 import glob
+import os
+import random
+
 import nibabel as nib
 import numpy as np
 import torch
-import torch.nn as nn
-from torchvision import transforms
-from monai.transforms import CropForeground, CenterSpatialCrop
 import torch.nn.functional as F
-import os
+from monai.transforms import *
 
 
 def threshold_at_one(x):
@@ -16,18 +16,26 @@ def threshold_at_one(x):
 
 background_cropper = CropForeground(select_fn=threshold_at_one)
 center_cropper = CenterSpatialCrop(roi_size=(512, 512, 120))  # 500
+#TODO: chnage spatial cropper for other plane types !!
+transforms_train = Compose(
+    [
+        RandRotate(range_x=1, prob=1),
+        RandGaussianNoise(prob=1, mean=0, std=0.2),
+        RandAffine(prob=0.5, scale_range=(-0.1, 0.1), translate_range=(-50, 50), rotate_range=(-1, 1),
+                   padding_mode="border")])
 
 
 class TUH_full_scan_dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_type, only_every_nth_slice=1, interpolation=False, augmentations=None, as_rgb=False,
-                 min_max_normalization=False):
+                 min_max_normalization=False, sample_shifting=False, plane='axial'):
         super(TUH_full_scan_dataset, self).__init__()
         self.as_rgb = as_rgb
         self.min_max_norm = min_max_normalization
         self.augmentations = augmentations
         self.nth_slice = only_every_nth_slice
         self.interpolation = interpolation
-        data_path = '/gpfs/space/home/joonas97/nnUNet/nn_pipeline/nnUNet_preprocessed/Task602_tuh_final/nnUNetData_plans_v2.1_stage1/'
+        self.sample_shifting = sample_shifting
+        self.plane = plane
         data_path = '/gpfs/space/projects/BetterMedicine/joonas/tuh_kidney_study/new_setup/MIL_EXP/'
 
         if dataset_type == "train":
@@ -38,6 +46,8 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
             raise ValueError("Dataset type should be either train or test")
         control_path = data_path + '/controls2/*nii.gz'
         tumor_path = data_path + '/tumors2/*nii.gz'
+
+        print("PLANE: ", plane)
         print("PATHS: ")
         print(control_path)
         print(tumor_path)
@@ -64,11 +74,33 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
         path = self.img_paths[index]
 
         x = nib.load(path).get_fdata()
-        x = x[:, :, ::self.nth_slice]
+
+        # PLANES: set it into default plane (axial)
+        # if transformations are needed we start from this position
+
+        x = np.flip(x, axis=1)
+        x = np.transpose(x, (1, 0, 2))
+        # this should give the most common axial representation for TUH dataset: (patient on their back)
+        if self.plane == "axial":
+            pass
+            # originally already in axial format
+        elif self.plane == "coronal":
+            x = np.transpose(x, (2, 1, 0))
+        elif self.plane == "sagital":
+            x = np.transpose(x, (2, 0, 1))
+        else:
+            raise ValueError('plane is not correctly specified')
+
+        if not self.sample_shifting:
+            x = x[:, :, ::self.nth_slice]
+        else:
+            shift = random.randint(0, self.nth_slice - 1)
+            x = x[:, :, shift::self.nth_slice]
+
         clipped_x = np.clip(x, np.percentile(x, q=0.05), np.percentile(x, q=99.5))
-        norm_x = (clipped_x - np.mean(clipped_x, axis=(0, 1))) / np.std(clipped_x, axis=(0, 1))  # mean 0, std 1 norm
+        norm_x = (clipped_x - np.mean(clipped_x, axis=(0, 1))) / (np.std(clipped_x, axis=(0, 1))+1)  # mean 0, std 1 norm
         # norm_x = (clipped_x - np.min(clipped_x)) / (np.max(clipped_x) - np.min(clipped_x)) ## 0-1 norm
-        norm_x = background_cropper(norm_x)
+        # norm_x = background_cropper(norm_x)
 
         norm_x = torch.unsqueeze(torch.from_numpy(norm_x), 0)
         norm_x = center_cropper(norm_x)
@@ -81,17 +113,13 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
         norm_x = torch.squeeze(norm_x)
 
         x = norm_x.to(torch.float16)
-        # print("mean, max, min: ",np.mean(x), np.max(x), np.min(x))
-        ## x = x[0]  # 0 - volume, 1 - segmentation might have to change it later depending on the data source
 
         y = torch.tensor(self.labels[index])
 
-        # if len(x.shape) == 2:
-        #    x = torch.stack([x, x, x], 0)
-        # compose = transforms.Compose([transforms.Normalize((torch.mean(x)),torch.std(x))])
-        # x = compose(x)
-        # if self.augmentations is not None:
-        #    x = self.augmentations(x)
+        if self.augmentations is not None:
+            for i in range(x.shape[2]):
+                x[:, :, i] = self.augmentations(np.expand_dims(x[:, :, i], 0))
+
         if self.as_rgb:
             x = torch.stack([x, x, x], dim=0)
             x = torch.squeeze(x)

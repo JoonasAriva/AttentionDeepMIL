@@ -7,7 +7,7 @@ project: MIL_TUH_EXP
 training:
   epochs: 75
   learning_rate: 1e-4
-  weight_decay: 10e-5
+  weight_decay: 5e-4
   seed: 1
 
 
@@ -16,7 +16,12 @@ model:
   name: resnet18
   pretrained_medicalnet: False
   pretrained_imagenet: True
+  neighbour_range: 0
 
-take_every_nth_slice: 4
-interpolation: False
+data:
+  take_every_nth_slice: 4
+  sample_shifting: False
+  interpolation: False
+  data_augmentations: False
+  plane: axial
 check: False

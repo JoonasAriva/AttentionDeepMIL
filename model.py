@@ -2,29 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18, ResNet18_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
 
 
 class ResNet18Attention(nn.Module):
 
-    def __init__(self):
+    def __init__(self, neighbour_range = 0):
         super(ResNet18Attention, self).__init__()
-        self.L = 512
+        self.neighbour_range = neighbour_range
+
+
+        print("Using neighbour attention with a range of ", self.neighbour_range)
+
+        self.L = 512 * 1 * 1
         self.D = 128
         self.K = 1
         model = resnet18(weights=ResNet18_Weights.DEFAULT)
-        # model = resnet18()
+
         # num_input_channel = 1
         # model.conv1 = nn.Conv2d(num_input_channel, 64, kernel_size=3, stride=1, bias=False)
         modules = list(model.children())[:-2]
         self.backbone = nn.Sequential(*modules)
-        # self.backbone = create_feature_extractor(
-        #    model, return_nodes={'layer4': 'extracted_features'})
+
         self.adaptive_pooling = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)))
         # self.pooling = nn.Sequential(nn.Linear(512 * 1 * 1, self.L),
         #                             nn.ReLU())
+
         self.attention = nn.Sequential(
-            nn.Linear(self.L, self.D),
+            nn.Linear(self.L * (1 + self.neighbour_range * 2), self.D),
             nn.Tanh(),
             nn.Linear(self.D, self.K)
         )
@@ -38,32 +42,27 @@ class ResNet18Attention(nn.Module):
     def forward(self, x):
         x = torch.squeeze(x, 0)
 
-        H = self.backbone(x)  # ["extracted_features"]
-        # print("backbone max and min, mean", torch.max(H), torch.min(H), torch.mean(H))
-        # print("backbone shape:")
-        # print(H.shape)
-        # print(torch.isnan(H).any())
+        H = self.backbone(x)
+
         H = self.adaptive_pooling(H)
-        # print("adaptive pooling max and min", torch.max(H), torch.min(H))
+
         H = H.view(-1, 512 * 1 * 1)
-        # print("pooling output:", H)
-        # print(H.shape)
-        # print(torch.isnan(H).any())
-        # H = self.pooling(H)
-        # print("pooling2 output:", H)
-        # print(H.shape)
-        # print(torch.isnan(H).any())
-        A = self.attention(H)  # NxK
-        # print("attention output:", A)
-        # print(A.shape)
+
+        if self.neighbour_range != 0:
+            combinedH = H.view(-1)
+            combinedH = F.pad(combinedH, (self.L*self.neighbour_range, self.L*self.neighbour_range), "constant", 0)
+            combinedH = combinedH.unfold(0, self.L * (self.neighbour_range * 2 + 1), self.L)
+
+            A = self.attention(combinedH)  # NxK
+        else:
+            A = self.attention(H)  # NxK
+
         A = torch.transpose(A, 1, 0)  # KxN
-        # print("shape after transposing ", A.shape)
+
         A = F.softmax(A, dim=1)  # softmax over N
-        # print("attention after softmax output:", A)
-        # print(A.shape)
+
         M = torch.mm(A, H)  # KxL
-        # print("after applying attention:", M)
-        # print(M.shape)
+
         Y_prob = self.classifier(M)
 
         Y_hat = self.sig(Y_prob)
@@ -74,15 +73,13 @@ class ResNet18Attention(nn.Module):
     # AUXILIARY METHODS
     def calculate_classification_error(self, Y, Y_hat):
         Y = Y.float()
-        # _, Y_hat, _ = self.forward(X)
-        # print("error calc: Y_hat, Y, eq():", Y_hat, Y, Y_hat.eq(Y))
         error = 1. - Y_hat.eq(Y).cpu().float().mean().data.item()
 
         return error
 
     def calculate_objective(self, Y, Y_prob):
         Y = Y.float()
-        # Y_prob, _, A = self.forward(X)
+
         print("calc objective Y,Y_prob: ")
         print(Y, Y_prob)
         Y_prob = torch.clamp(Y_prob, min=1e-5, max=1. - 1e-5)
