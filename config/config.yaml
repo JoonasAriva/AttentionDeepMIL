@@ -24,4 +24,5 @@ data:
   interpolation: False
   data_augmentations: False
   plane: axial
+  datasets: ['TUH_kidney']
 check: False

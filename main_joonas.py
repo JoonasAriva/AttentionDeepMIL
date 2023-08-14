@@ -7,12 +7,13 @@ from pathlib import Path
 
 import hydra
 import numpy as np
+import pandas as pd
 import torch
 import torch.optim as optim
 import torch.utils.data as data_utils
 import wandb
 from monai.transforms import *
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf, DictConfig
 from tqdm import tqdm
 
 from model import Attention, GatedAttention, ResNet18Attention
@@ -20,24 +21,42 @@ from model import Attention, GatedAttention, ResNet18Attention
 sys.path.append('/gpfs/space/home/joonas97/MIL/AttentionDeepMIL')
 from dataloader_TUH import TUH_full_scan_dataset
 
+sys.path.append('/gpfs/space/home/joonas97/MIL')
+from utils.utils import find_case_id, attention_accuracy, center_crop_dataframe
+
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 # Training settings
 
 dir_checkpoint = Path('./checkpoints/')
+CROP_SIZE = 120
+
+# read in statistics about the scans for validation metrics
+test_ROIS = pd.read_csv("test_ROIs.csv")
+train_ROIS = pd.read_csv("train_ROIs.csv")
 
 
-def train(model, optimizer, train_loader, epoch, loss_function, check=False):
+def train(model, optimizer, train_loader, loss_function, epoch: int, TUH_length: int,
+          check: bool = False):
     model.train()
     train_loss = 0.
     train_error = 0.
+    # attention related accuracies
+    train_all_attention_acc = 0.
+    train_tumor_only_attention_acc = 0.
     step = 0
     tepoch = tqdm(train_loader, unit="batch", ascii=True)
-    for data, bag_label in tepoch:
+    for data, bag_label, file_path in tepoch:
         tepoch.set_description(f"Epoch {epoch}")
         step += 1
-
-        #_, c, x, y, h = data.shape
-        #data = torch.reshape(data, (1, h, c, x, y))
+        if 'tuh_kidney' in file_path[0]:
+            calculate_attention_accuracy = True
+            case_id = find_case_id(file_path, start_string='case_', end_string='_0000')
+            rois = train_ROIS.loc[train_ROIS["file_name"] == "case_" + case_id + "_0000.nii.gz"].copy()
+            rois = center_crop_dataframe(rois, CROP_SIZE)
+        else:
+            calculate_attention_accuracy = False
+        # _, c, x, y, h = data.shape
+        # data = torch.reshape(data, (1, h, c, x, y))
         data = torch.permute(data, (0, 4, 1, 2, 3))
         data, bag_label = data.cuda(), bag_label.cuda()
 
@@ -55,6 +74,11 @@ def train(model, optimizer, train_loader, epoch, loss_function, check=False):
         loss.backward()
         # step
         optimizer.step()
+        if calculate_attention_accuracy:
+            attention = A.as_tensor().cpu().detach()[0]
+            all_acc, tumor_only_acc = attention_accuracy(attention=np.array(attention), df=rois)
+            train_all_attention_acc += all_acc
+            train_tumor_only_attention_acc += tumor_only_acc
 
         if step >= 20 and check:
             break
@@ -62,23 +86,37 @@ def train(model, optimizer, train_loader, epoch, loss_function, check=False):
     # calculate loss and error for epoch
     train_loss /= len(train_loader)
     train_error /= len(train_loader)
-    print('Train loss: {:.4f}, Train error: {:.4f}'.format(train_loss, train_error))
-    return train_loss, train_error
+    train_all_attention_acc /= TUH_length
+    train_tumor_only_attention_acc /= TUH_length
+    print('Train loss: {:.4f}, Train error: {:.4f}, attention_accuracy: {:.4f}'.format(train_loss, train_error,
+                                                                                       train_all_attention_acc))
+    return train_loss, train_error, train_all_attention_acc, train_tumor_only_attention_acc
 
 
-def validation(model, test_loader, loss_function, epoch, val_dict, check=False):
+def validation(model, test_loader, loss_function, epoch: int, TUH_length: int, check: bool = False):
     # model.eval()
     model.train()
 
     test_loss = 0.
     test_error = 0.
     step = 0
+    # attention related accuracies
+    test_all_attention_acc = 0.
+    test_tumor_only_attention_acc = 0.
     tepoch = tqdm(test_loader, unit="batch", ascii=True)
-    for data, bag_label in tepoch:
+    for data, bag_label, file_path in tepoch:
         tepoch.set_description(f"Validation of epoch {epoch}")
         step += 1
 
-        #_, c, x, y, h = data.shape # should permute to --> (1, h, c, x, y)
+        if 'tuh_kidney' in file_path[0]:
+            calculate_attention_accuracy = True
+            case_id = find_case_id(file_path, start_string='case_', end_string='_0000')
+            rois = test_ROIS.loc[test_ROIS["file_name"] == "case_" + case_id + "_0000.nii.gz"].copy()
+            rois = center_crop_dataframe(rois, CROP_SIZE)
+        else:
+            calculate_attention_accuracy = False
+
+        # _, c, x, y, h = data.shape # should permute to --> (1, h, c, x, y)
         data = torch.permute(data, (0, 4, 1, 2, 3))
         data, bag_label = data.cuda(), bag_label.cuda()
         with torch.no_grad(), torch.cuda.amp.autocast():
@@ -88,21 +126,22 @@ def validation(model, test_loader, loss_function, epoch, val_dict, check=False):
             test_loss += loss.item()  # .data[0]
             error = model.calculate_classification_error(bag_label, predicted_label)
             test_error += error
-
-        if str(step) in val_dict:
-            val_dict[str(step)][0].append(int(predicted_label.as_tensor().cpu().item()))
-        else:
-            val_dict[str(step)] = ([], [data.shape])
-            val_dict[str(step)][0].append(int(predicted_label.as_tensor().cpu().item()))
-        # print(val_dict)
+        if calculate_attention_accuracy:
+            attention = attention_weights.as_tensor().cpu().detach()[0]
+            all_acc, tumor_only_acc = attention_accuracy(attention=np.array(attention), df=rois)
+            test_all_attention_acc += all_acc
+            test_tumor_only_attention_acc += tumor_only_acc
         if step >= 20 and check:
             break
 
     test_error /= len(test_loader)
     test_loss /= len(test_loader)
+    test_all_attention_acc /= TUH_length
+    test_tumor_only_attention_acc /= TUH_length
 
-    print('\nTest Set, Loss: {:.4f}, Test error: {:.4f}'.format(test_loss, test_error))
-    return test_loss, test_error, val_dict
+    print('\nTest Set, Loss: {:.4f}, Test error: {:.4f}, attention_accuracy: {:.4f}'.format(test_loss, test_error,
+                                                                                            test_all_attention_acc))
+    return test_loss, test_error, test_all_attention_acc, test_tumor_only_attention_acc
 
 
 @hydra.main(config_path="config", config_name="config", version_base='1.1')
@@ -111,8 +150,8 @@ def main(cfg: DictConfig):
     print(f"Running {cfg.project}, Work in {os.getcwd()}")
 
     np.random.seed(cfg.training.seed)
-
     torch.manual_seed(cfg.training.seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.training.seed)
         print('\nGPU is ON!')
@@ -128,13 +167,15 @@ def main(cfg: DictConfig):
                        padding_mode="border")
         ])
 
-    train_dataset = TUH_full_scan_dataset(dataset_type="train", only_every_nth_slice=cfg.data.take_every_nth_slice,
+    train_dataset = TUH_full_scan_dataset(datasets=cfg.data.datasets, dataset_type="train",
+                                          only_every_nth_slice=cfg.data.take_every_nth_slice,
                                           interpolation=cfg.data.interpolation, as_rgb=True,
                                           sample_shifting=cfg.data.sample_shifting,
                                           augmentations=transforms_train if cfg.data.data_augmentations is True else None,
-                                          plane = cfg.data.plane)
-    test_dataset = TUH_full_scan_dataset(dataset_type="test", only_every_nth_slice=cfg.data.take_every_nth_slice,
-                                         interpolation=cfg.data.interpolation, as_rgb=True, plane = cfg.data.plane)
+                                          plane=cfg.data.plane)
+    test_dataset = TUH_full_scan_dataset(datasets=cfg.data.datasets, dataset_type="test",
+                                         only_every_nth_slice=cfg.data.take_every_nth_slice,
+                                         interpolation=cfg.data.interpolation, as_rgb=True, plane=cfg.data.plane)
     train_loader = data_utils.DataLoader(train_dataset,
                                          batch_size=1,
                                          shuffle=True,
@@ -144,6 +185,9 @@ def main(cfg: DictConfig):
                                         batch_size=1,
                                         shuffle=False,
                                         **loader_kwargs)
+
+    TUH_length_train = train_dataset.TUH_length
+    TUH_length_test = test_dataset.TUH_length
 
     logging.info('Init Model')
 
@@ -160,15 +204,16 @@ def main(cfg: DictConfig):
         # if you need to continue training
     if "checkpoint" in cfg.keys():
         print("Using checkpoint", cfg.checkpoint)
-        model.load_state_dict(torch.load(os.path.join('/gpfs/space/home/joonas97/MIL/AttentionDeepMIL/', cfg.checkpoint)))
+        model.load_state_dict(
+            torch.load(os.path.join('/gpfs/space/home/joonas97/MIL/AttentionDeepMIL/', cfg.checkpoint)))
     if torch.cuda.is_available():
         model.cuda()
-
 
     # summary(model, (3, 512, 512))
     optimizer = optim.Adam(model.parameters(), lr=cfg.training.learning_rate, betas=(0.9, 0.999),
                            weight_decay=cfg.training.weight_decay)
     loss_function = torch.nn.BCEWithLogitsLoss().cuda()
+
     if not cfg.check:
         experiment = wandb.init(project='MIL experiment on TUH kidney study', resume='allow', anonymous='must')
         experiment.config.update(
@@ -180,25 +225,35 @@ def main(cfg: DictConfig):
     best_test_error = 1  # should be 1
     best_test_loss = 10
     best_epoch = 0
+    best_attention = 0
     not_improved_epochs = 0
 
-    val_dict = dict()
     for epoch in range(1, cfg.training.epochs + 1):
-        train_loss, train_error = train(model, optimizer, train_loader, epoch, loss_function, check=cfg.check)
-        test_loss, test_error, val_dict = validation(model, test_loader, loss_function, epoch, val_dict,
-                                                     check=cfg.check)
-        # for k, v in val_dict.items():
-        #    print(k, v)
+        train_loss, train_error, train_att_all, train_att_tumor = train(model, optimizer, train_loader,
+                                                                        loss_function, epoch,
+                                                                        TUH_length=TUH_length_train,
+                                                                        check=cfg.check)
+        test_loss, test_error, test_att_all, test_att_tumor = validation(model, test_loader, loss_function, epoch,
+                                                                         TUH_length=TUH_length_test,
+                                                                         check=cfg.check)
         if cfg.check:
             logging.info("Model check completed")
             return
-        if test_loss < best_test_loss:
+        if test_error < best_test_error:
 
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), str(dir_checkpoint / 'best_model.pth'))
-            logging.info(f"Best new model at epoch {epoch}!")
-            # best_test_error = test_error
-            best_test_loss = test_loss
+            logging.info(f"Best new model at epoch {epoch} (smallest test error)!")
+
+            best_test_error = test_error
+            best_epoch = epoch
+            not_improved_epochs = 0
+        elif test_att_all > best_attention:
+            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), str(dir_checkpoint / 'best_attention_model.pth'))
+            logging.info(f"Best new attention at epoch {epoch}!")
+
+            best_attention = test_att_all
             best_epoch = epoch
             not_improved_epochs = 0
         else:
@@ -211,6 +266,10 @@ def main(cfg: DictConfig):
             'test loss': test_loss,
             'train error': train_error,
             'test error': test_error,
+            'train_attention_accuracy': train_att_all,
+            'test_attention_accuracy': test_att_all,
+            'train_tumor_attention_accuracy': train_att_tumor,
+            'test_tumor_attention_accuracy': test_att_tumor,
             'epoch': epoch})
 
     torch.save(model.state_dict(), str(dir_checkpoint / 'last_model.pth'))
