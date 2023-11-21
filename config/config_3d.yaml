@@ -13,19 +13,14 @@ training:
 
 model:
   classes: 2
-  name: resnet18
+  name: efficientnet-b2
   pretrained_medicalnet: False
-  pretrained_imagenet: True
-  neighbour_range: 0
-  freeze_backbone: False
 
 data:
-  take_every_nth_slice: 2
-  sample_shifting: False
-  downsample: False
-  data_augmentations: True
+  data_augmentations: False
   plane: axial
-  datasets: ['TUH_kidney','kits23','totalsegmentor']
+  datasets: ['TUH_kidney','totalsegmentor','kits23']
   artifical_spheres: False
-  crop_size: 400
+  crop_size: 512
+  downsample: True
 check: False

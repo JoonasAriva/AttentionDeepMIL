@@ -1,15 +1,25 @@
 hydra:
   run:
-    dir: results/${hydra.job.name}/${model.name}/${data}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: results/${hydra.job.name}/${model.name}/${data.type}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 project: tuh_CAMS
 
 model:
-  name: resnet18
+  name: efficientnet-b2
   classes: 2
   pytorch_implementation: True
 
-data: train
+
+
+data:
+  type: train
+  data_augmentations: False
+  plane: axial
+  datasets: [ 'TUH_kidney']
+  artifical_spheres: False
+  crop_size: 330
+
+check: False
 
 
 

@@ -89,6 +89,40 @@ class ResNet18Attention(nn.Module):
         print(neg_log_likelihood.data)
         return neg_log_likelihood
 
+class ResNet18AttentionSigmoid(ResNet18Attention):
+
+    def forward(self, x):
+        x = torch.squeeze(x, 0)
+
+        H = self.backbone(x)
+
+        H = self.adaptive_pooling(H)
+
+        H = H.view(-1, 512 * 1 * 1)
+
+        if self.neighbour_range != 0:
+            combinedH = H.view(-1)
+            combinedH = F.pad(combinedH, (self.L*self.neighbour_range, self.L*self.neighbour_range), "constant", 0)
+            combinedH = combinedH.unfold(0, self.L * (self.neighbour_range * 2 + 1), self.L)
+
+            A = self.attention(combinedH)  # NxK
+        else:
+            A = self.attention(H)  # NxK
+
+        A = torch.transpose(A, 1, 0)  # KxN
+
+        A = self.sig(A)
+        A = A/ A.sum()
+
+        M = torch.mm(A, H)  # KxL
+
+        Y_prob = self.classifier(M)
+
+        Y_hat = self.sig(Y_prob)
+        Y_hat = torch.ge(Y_hat, 0.5).float()
+
+        return Y_prob, Y_hat, A
+
 
 class Attention(nn.Module):
     def __init__(self):
@@ -156,6 +190,13 @@ class Attention(nn.Module):
 
         return neg_log_likelihood, A
 
+def min_loss(pred):
+    return torch.mean(torch.square(torch.min(pred, dim=1).view(-1) - 0))
+
+def min_max_loss(pred,truth):
+    bce_loss = torch.nn.BCEWithLogitsLoss(pred, truth)
+
+    return
 
 class GatedAttention(nn.Module):
     def __init__(self):

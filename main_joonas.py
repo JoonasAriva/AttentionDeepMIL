@@ -15,8 +15,8 @@ import wandb
 from monai.transforms import *
 from omegaconf import OmegaConf, DictConfig
 from tqdm import tqdm
-
-from model import Attention, GatedAttention, ResNet18Attention
+import gc
+from model import Attention, GatedAttention, ResNet18Attention, ResNet18AttentionSigmoid
 
 sys.path.append('/gpfs/space/home/joonas97/MIL/AttentionDeepMIL')
 from dataloader_TUH import TUH_full_scan_dataset
@@ -28,31 +28,34 @@ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 # Training settings
 
 dir_checkpoint = Path('./checkpoints/')
+
 CROP_SIZE = 120
 
-# read in statistics about the scans for validation metrics
-test_ROIS = pd.read_csv("test_ROIs.csv")
-train_ROIS = pd.read_csv("train_ROIs.csv")
 
-
-def train(model, optimizer, train_loader, loss_function, epoch: int, TUH_length: int,
+def train(model, optimizer, train_loader, loss_function, epoch: int, ROIS: pd.DataFrame, TUH_length: int,
+          nth_slice: int, crop_size: int,
           check: bool = False):
     model.train()
+    scaler = torch.cuda.amp.GradScaler()
     train_loss = 0.
     train_error = 0.
     # attention related accuracies
     train_all_attention_acc = 0.
     train_tumor_only_attention_acc = 0.
+    train_all_recall = 0.
     step = 0
     tepoch = tqdm(train_loader, unit="batch", ascii=True)
     for data, bag_label, file_path in tepoch:
         tepoch.set_description(f"Epoch {epoch}")
+        gc.collect()
         step += 1
         if 'tuh_kidney' in file_path[0]:
             calculate_attention_accuracy = True
             case_id = find_case_id(file_path, start_string='case_', end_string='_0000')
-            rois = train_ROIS.loc[train_ROIS["file_name"] == "case_" + case_id + "_0000.nii.gz"].copy()
-            rois = center_crop_dataframe(rois, CROP_SIZE)
+
+            rois = ROIS.loc[ROIS["file_name"] == "case_" + case_id + "_0000.nii.gz"].copy()[::nth_slice]
+            rois = center_crop_dataframe(rois, crop_size)
+
         else:
             calculate_attention_accuracy = False
         # _, c, x, y, h = data.shape
@@ -61,25 +64,30 @@ def train(model, optimizer, train_loader, loss_function, epoch: int, TUH_length:
         data, bag_label = data.cuda(), bag_label.cuda()
 
         # reset gradients
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         # calculate loss and metrics
         with torch.cuda.amp.autocast():
             Y_prob, Y_hat, A = model.forward(data)
             loss = loss_function(Y_prob, bag_label.float())
-            train_loss += loss.item()
-            error = model.calculate_classification_error(bag_label, Y_hat)
+
+        train_loss += loss.item()
+        error = model.calculate_classification_error(bag_label, Y_hat)
 
         train_error += error
         # backward pass
-        loss.backward()
-        # step
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # reset gradients
+        optimizer.zero_grad(set_to_none=True)
+
+
         if calculate_attention_accuracy:
             attention = A.as_tensor().cpu().detach()[0]
-            all_acc, tumor_only_acc = attention_accuracy(attention=np.array(attention), df=rois)
+            all_acc, tumor_only_acc, all_recall = attention_accuracy(attention=np.array(attention), df=rois)
             train_all_attention_acc += all_acc
             train_tumor_only_attention_acc += tumor_only_acc
-
+            train_all_recall += all_recall
         if step >= 20 and check:
             break
 
@@ -88,12 +96,15 @@ def train(model, optimizer, train_loader, loss_function, epoch: int, TUH_length:
     train_error /= len(train_loader)
     train_all_attention_acc /= TUH_length
     train_tumor_only_attention_acc /= TUH_length
+    train_all_recall /= TUH_length
     print('Train loss: {:.4f}, Train error: {:.4f}, attention_accuracy: {:.4f}'.format(train_loss, train_error,
                                                                                        train_all_attention_acc))
-    return train_loss, train_error, train_all_attention_acc, train_tumor_only_attention_acc
+    return train_loss, train_error, train_all_attention_acc, train_tumor_only_attention_acc, train_all_recall
 
 
-def validation(model, test_loader, loss_function, epoch: int, TUH_length: int, check: bool = False):
+def validation(model, test_loader, loss_function, epoch: int, ROIS: pd.DataFrame, TUH_length: int, nth_slice: int,
+               crop_size: int,
+               check: bool = False):
     # model.eval()
     model.train()
 
@@ -103,6 +114,7 @@ def validation(model, test_loader, loss_function, epoch: int, TUH_length: int, c
     # attention related accuracies
     test_all_attention_acc = 0.
     test_tumor_only_attention_acc = 0.
+    test_all_recall = 0.
     tepoch = tqdm(test_loader, unit="batch", ascii=True)
     for data, bag_label, file_path in tepoch:
         tepoch.set_description(f"Validation of epoch {epoch}")
@@ -111,8 +123,8 @@ def validation(model, test_loader, loss_function, epoch: int, TUH_length: int, c
         if 'tuh_kidney' in file_path[0]:
             calculate_attention_accuracy = True
             case_id = find_case_id(file_path, start_string='case_', end_string='_0000')
-            rois = test_ROIS.loc[test_ROIS["file_name"] == "case_" + case_id + "_0000.nii.gz"].copy()
-            rois = center_crop_dataframe(rois, CROP_SIZE)
+            rois = ROIS.loc[ROIS["file_name"] == "case_" + case_id + "_0000.nii.gz"].copy()[::nth_slice]
+            rois = center_crop_dataframe(rois, crop_size)
         else:
             calculate_attention_accuracy = False
 
@@ -128,9 +140,10 @@ def validation(model, test_loader, loss_function, epoch: int, TUH_length: int, c
             test_error += error
         if calculate_attention_accuracy:
             attention = attention_weights.as_tensor().cpu().detach()[0]
-            all_acc, tumor_only_acc = attention_accuracy(attention=np.array(attention), df=rois)
+            all_acc, tumor_only_acc, all_recall = attention_accuracy(attention=np.array(attention), df=rois)
             test_all_attention_acc += all_acc
             test_tumor_only_attention_acc += tumor_only_acc
+            test_all_recall += all_recall
         if step >= 20 and check:
             break
 
@@ -138,15 +151,16 @@ def validation(model, test_loader, loss_function, epoch: int, TUH_length: int, c
     test_loss /= len(test_loader)
     test_all_attention_acc /= TUH_length
     test_tumor_only_attention_acc /= TUH_length
-
+    test_all_recall /= TUH_length
     print('\nTest Set, Loss: {:.4f}, Test error: {:.4f}, attention_accuracy: {:.4f}'.format(test_loss, test_error,
                                                                                             test_all_attention_acc))
-    return test_loss, test_error, test_all_attention_acc, test_tumor_only_attention_acc
+    return test_loss, test_error, test_all_attention_acc, test_tumor_only_attention_acc, test_all_recall
 
 
 @hydra.main(config_path="config", config_name="config", version_base='1.1')
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
+    OmegaConf.save(cfg, "config.yaml")
     print(f"Running {cfg.project}, Work in {os.getcwd()}")
 
     np.random.seed(cfg.training.seed)
@@ -157,7 +171,7 @@ def main(cfg: DictConfig):
         print('\nGPU is ON!')
 
     print('Load Train and Test Set')
-    loader_kwargs = {'num_workers': 1, 'pin_memory': True} if torch.cuda.is_available() else {}
+    loader_kwargs = {'num_workers': 4, 'pin_memory': True} if torch.cuda.is_available() else {}
 
     transforms_train = Compose(
         [
@@ -169,13 +183,16 @@ def main(cfg: DictConfig):
 
     train_dataset = TUH_full_scan_dataset(datasets=cfg.data.datasets, dataset_type="train",
                                           only_every_nth_slice=cfg.data.take_every_nth_slice,
-                                          interpolation=cfg.data.interpolation, as_rgb=True,
+                                          downsample=cfg.data.downsample, as_rgb=True,
                                           sample_shifting=cfg.data.sample_shifting,
                                           augmentations=transforms_train if cfg.data.data_augmentations is True else None,
-                                          plane=cfg.data.plane)
+                                          plane=cfg.data.plane, center_crop=cfg.data.crop_size,
+                                          artificial_spheres=cfg.data.artifical_spheres)
     test_dataset = TUH_full_scan_dataset(datasets=cfg.data.datasets, dataset_type="test",
                                          only_every_nth_slice=cfg.data.take_every_nth_slice,
-                                         interpolation=cfg.data.interpolation, as_rgb=True, plane=cfg.data.plane)
+                                         downsample=cfg.data.downsample, as_rgb=True, plane=cfg.data.plane,
+                                         center_crop=cfg.data.crop_size,
+                                         artificial_spheres=cfg.data.artifical_spheres)
     train_loader = data_utils.DataLoader(train_dataset,
                                          batch_size=1,
                                          shuffle=True,
@@ -189,13 +206,25 @@ def main(cfg: DictConfig):
     TUH_length_train = train_dataset.TUH_length
     TUH_length_test = test_dataset.TUH_length
 
+    # read in statistics about the scans for validation metrics
+    base_path = '/gpfs/space/home/joonas97/MIL/AttentionDeepMIL/'
+    test_ROIS = pd.read_csv(base_path + "ROIS/{0}_test_ROIS.csv".format(cfg.data.plane))
+    train_ROIS = pd.read_csv(base_path + "ROIS/{0}_train_ROIS.csv".format(cfg.data.plane))
+
     logging.info('Init Model')
 
     if cfg.model.name == 'resnet18':
         model = ResNet18Attention(
             neighbour_range=cfg.model.neighbour_range)
-        # Let's freeze the backbone
-        # model.backbone.requires_grad_(False)
+
+        if cfg.model.freeze_backbone:
+            # Let's freeze the backbone
+            model.backbone.requires_grad_(False)
+
+    elif cfg.model.name == 'resnet18sigmoid':
+        model = ResNet18AttentionSigmoid(
+            neighbour_range=cfg.model.neighbour_range)
+
     elif cfg.model.name == 'attention':
         model = Attention()
     elif cfg.model.name == 'gated_attention':
@@ -209,7 +238,7 @@ def main(cfg: DictConfig):
     if torch.cuda.is_available():
         model.cuda()
 
-    # summary(model, (3, 512, 512))
+    # summary(model, (216, 216, 216))
     optimizer = optim.Adam(model.parameters(), lr=cfg.training.learning_rate, betas=(0.9, 0.999),
                            weight_decay=cfg.training.weight_decay)
     loss_function = torch.nn.BCEWithLogitsLoss().cuda()
@@ -219,7 +248,7 @@ def main(cfg: DictConfig):
         experiment.config.update(
             dict(epochs=cfg.training.epochs,
                  learning_rate=cfg.training.learning_rate, model_name=cfg.model.name,
-                 weight_decay=cfg.training.weight_decay))
+                 weight_decay=cfg.training.weight_decay, directory=os.getcwd()))
     logging.info('Start Training')
 
     best_test_error = 1  # should be 1
@@ -229,13 +258,21 @@ def main(cfg: DictConfig):
     not_improved_epochs = 0
 
     for epoch in range(1, cfg.training.epochs + 1):
-        train_loss, train_error, train_att_all, train_att_tumor = train(model, optimizer, train_loader,
-                                                                        loss_function, epoch,
-                                                                        TUH_length=TUH_length_train,
-                                                                        check=cfg.check)
-        test_loss, test_error, test_att_all, test_att_tumor = validation(model, test_loader, loss_function, epoch,
-                                                                         TUH_length=TUH_length_test,
-                                                                         check=cfg.check)
+        train_loss, train_error, train_att_all, train_att_tumor, train_att_recall = train(model, optimizer,
+                                                                                          train_loader,
+                                                                                          loss_function, epoch,
+                                                                                          ROIS=train_ROIS,
+                                                                                          TUH_length=TUH_length_train,
+                                                                                          nth_slice=cfg.data.take_every_nth_slice,
+                                                                                          crop_size=cfg.data.crop_size,
+                                                                                          check=cfg.check)
+        test_loss, test_error, test_att_all, test_att_tumor, test_att_recall = validation(model, test_loader,
+                                                                                          loss_function, epoch,
+                                                                                          ROIS=test_ROIS,
+                                                                                          TUH_length=TUH_length_test,
+                                                                                          nth_slice=cfg.data.take_every_nth_slice,
+                                                                                          crop_size=cfg.data.crop_size,
+                                                                                          check=cfg.check)
         if cfg.check:
             logging.info("Model check completed")
             return
@@ -270,6 +307,8 @@ def main(cfg: DictConfig):
             'test_attention_accuracy': test_att_all,
             'train_tumor_attention_accuracy': train_att_tumor,
             'test_tumor_attention_accuracy': test_att_tumor,
+            'train_attention_recall': train_att_recall,
+            'test_attention_recall': test_att_recall,
             'epoch': epoch})
 
     torch.save(model.state_dict(), str(dir_checkpoint / 'last_model.pth'))

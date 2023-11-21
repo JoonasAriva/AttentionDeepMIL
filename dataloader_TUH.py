@@ -5,6 +5,7 @@ from typing import List, Tuple
 
 import nibabel as nib
 import numpy as np
+import raster_geometry as rg
 import torch
 import torch.nn.functional as F
 from monai.transforms import *
@@ -16,7 +17,7 @@ def threshold_at_one(x):
 
 
 background_cropper = CropForeground(select_fn=threshold_at_one)
-center_cropper = CenterSpatialCrop(roi_size=(512, 512, 120))  # 500
+
 # TODO: change spatial cropper for other plane types !!
 transforms_train = Compose(
     [
@@ -24,6 +25,22 @@ transforms_train = Compose(
         RandGaussianNoise(prob=1, mean=0, std=0.2),
         RandAffine(prob=0.5, scale_range=(-0.1, 0.1), translate_range=(-50, 50), rotate_range=(-1, 1),
                    padding_mode="border")])
+
+
+def add_random_sphere(image):
+    size = image.shape[1]
+    height = image.shape[2]
+
+    z, y, x = np.random.uniform(0.1, 0.9), np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)
+
+    radius = np.random.randint(20, 40)
+
+    sphere_mask = rg.sphere((size, size, height), radius, (y, x, z))
+    gaussian_noise = torch.HalfTensor(np.random.randn(size, size, height) * 0.2 + 1.7)
+
+    image[sphere_mask] = gaussian_noise[sphere_mask]
+
+    return image
 
 
 def get_dataset_paths(datasets: List[str], dataset_type: str) -> Tuple[List[str], List[str], int]:
@@ -40,7 +57,7 @@ def get_dataset_paths(datasets: List[str], dataset_type: str) -> Tuple[List[str]
     print("DATASET TYPE (TRAIN/TEST):", dataset_type)
     print("using the combination of ", len(datasets), "datasets")
 
-    TUH_study_length = 1 #used for calculating attention accuracy, if no TUH is used, will be 1
+    TUH_study_length = 1  # used for calculating attention accuracy, if no TUH is used, will be 1
     if "TUH_kidney" in datasets:
         data_path = os.path.join(TUH_data_path, dataset_type)
 
@@ -84,43 +101,31 @@ def get_dataset_paths(datasets: List[str], dataset_type: str) -> Tuple[List[str]
         # kits only has tumor cases
         tumor = glob.glob(data_path)
         # take only fraction of kits to keep dataset class balance
-        tumor = tumor[:int(len(tumor)*0.37)]
+        tumor = tumor[:int(len(tumor) * 0.37)]
         all_tumors.extend(tumor)
 
     return all_controls, all_tumors, TUH_study_length
 
 
 class TUH_full_scan_dataset(torch.utils.data.Dataset):
-    def __init__(self, datasets: List[str], dataset_type: str, only_every_nth_slice: int = 1, interpolation: bool = False,
+    def __init__(self, datasets: List[str], dataset_type: str, only_every_nth_slice: int = 1,
+                 downsample: bool = False,
                  augmentations: callable = None, as_rgb: bool = False,
-                 min_max_normalization: bool = False, sample_shifting: bool = False, plane: str = 'axial'):
+                 min_max_normalization: bool = False, sample_shifting: bool = False, plane: str = 'axial',center_crop: int = 120,artificial_spheres : bool = False):
         super(TUH_full_scan_dataset, self).__init__()
         self.as_rgb = as_rgb
         self.min_max_norm = min_max_normalization
         self.augmentations = augmentations
         self.nth_slice = only_every_nth_slice
-        self.interpolation = interpolation
+        self.downsample = downsample
         self.sample_shifting = sample_shifting
         self.plane = plane
-        # data_path = '/gpfs/space/projects/BetterMedicine/joonas/tuh_kidney_study/new_setup/MIL_EXP/'
-        #
-        # if dataset_type == "train":
-        #     data_path = os.path.join(data_path, "train")
-        # elif dataset_type == "test":
-        #     data_path = os.path.join(data_path, "test")
-        # else:
-        #     raise ValueError("Dataset type should be either train or test")
-        # control_path = data_path + '/controls2/*nii.gz'
-        # tumor_path = data_path + '/tumors2/*nii.gz'
+        self.artifical_spheres = artificial_spheres
 
+        self.center_cropper = CenterSpatialCrop(roi_size=(512, 512, center_crop))  # 500
         print("PLANE: ", plane)
-
-        # print("PATHS: ")
-        # print(control_path)
-        # print(tumor_path)
-        # control = glob.glob(control_path)
-        # tumor = glob.glob(tumor_path)
-
+        print("CROP SIZE: ", center_crop)
+        print("ARTIFICIAL SPHERES EXPERIMENT: ", artificial_spheres)
         control, tumor, TUH_length = get_dataset_paths(datasets=datasets, dataset_type=dataset_type)
         control_labels = [[False]] * len(control)
         tumor_labels = [[True]] * len(tumor)
@@ -148,9 +153,9 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
         if not "kits23" in path:
             x = np.flip(x, axis=1)
             x = np.transpose(x, (1, 0, 2))
-        else: #kits is in another orientation
+        else:  # kits is in another orientation
             x = np.transpose(x, (1, 2, 0))
-        # this should give the most common axial representation for TUH dataset: (patient on their back)
+        # this should give the most common axial representation: (patient on their back)
         if self.plane == "axial":
             pass
             # originally already in axial format
@@ -161,10 +166,21 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
         else:
             raise ValueError('plane is not correctly specified')
 
+
+        h, w, d = x.shape
+
+        if self.downsample:
+            x = torch.from_numpy(x.copy())
+            x = F.interpolate(torch.unsqueeze(torch.unsqueeze(x,0),0), scale_factor=0.5,
+                                   mode='trilinear', align_corners=False)
+
+
+            x = np.array(torch.squeeze(x))
         if not self.sample_shifting:
 
-            if x.shape[2] < 80 and "tuh_kidney" not in path: #take more slices if the scan is small
-                x = x[:, :, ::max(int(self.nth_slice - 2), 2)]
+            if x.shape[2] < 80 and "tuh_kidney" not in path:
+                # take more slices if the scan is small, currently cannot do it for tuh study as attention accuracy is measured only on certain slices
+                x = x[:, :, ::max(int(self.nth_slice - 2), 1)]
             else:
                 x = x[:, :, ::self.nth_slice]
         else:
@@ -174,22 +190,29 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
         clipped_x = np.clip(x, np.percentile(x, q=0.05), np.percentile(x, q=99.5))
         norm_x = (clipped_x - np.mean(clipped_x, axis=(0, 1))) / (
                 np.std(clipped_x, axis=(0, 1)) + 1)  # mean 0, std 1 norm
-        # norm_x = (clipped_x - np.min(clipped_x)) / (np.max(clipped_x) - np.min(clipped_x)) ## 0-1 norm
-        # norm_x = background_cropper(norm_x)
 
         norm_x = torch.unsqueeze(torch.from_numpy(norm_x), 0)
-        norm_x = center_cropper(norm_x)
-        # norm_x = torch.tensor(norm_x)
+        norm_x = self.center_cropper(norm_x)
 
-        _, h, w, d = norm_x.shape
-        if self.interpolation:
-            norm_x = F.interpolate(torch.unsqueeze(norm_x, 0), size=(int(h / 2), int(w / 2), d),
-                                   mode='trilinear', align_corners=False)
+
         norm_x = torch.squeeze(norm_x)
 
         x = norm_x.to(torch.float16)
 
-        y = torch.tensor(self.labels[index])
+
+        if self.artifical_spheres:
+
+            label = np.random.randint(0, 2)
+
+            if label == 1:
+                #create sphere
+                x = add_random_sphere(x)
+                y = torch.tensor([True])
+            else:
+                # do not create sphere
+                y = torch.tensor([False])
+        else:
+            y = torch.tensor(self.labels[index])
 
         if self.augmentations is not None:
             for i in range(x.shape[2]):
