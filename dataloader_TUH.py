@@ -40,7 +40,7 @@ def get_dataset_paths(datasets: List[str], dataset_type: str) -> Tuple[List[str]
     print("DATASET TYPE (TRAIN/TEST):", dataset_type)
     print("using the combination of ", len(datasets), "datasets")
 
-    TUH_study_length = 1 #used for calculating attention accuracy, if no TUH is used, will be 1
+    TUH_study_length = 1  # used for calculating attention accuracy, if no TUH is used, will be 1
     if "TUH_kidney" in datasets:
         data_path = os.path.join(TUH_data_path, dataset_type)
 
@@ -84,24 +84,28 @@ def get_dataset_paths(datasets: List[str], dataset_type: str) -> Tuple[List[str]
         # kits only has tumor cases
         tumor = glob.glob(data_path)
         # take only fraction of kits to keep dataset class balance
-        tumor = tumor[:int(len(tumor)*0.37)]
+        tumor = tumor[:int(len(tumor) * 0.37)]
         all_tumors.extend(tumor)
 
     return all_controls, all_tumors, TUH_study_length
 
 
 class TUH_full_scan_dataset(torch.utils.data.Dataset):
-    def __init__(self, datasets: List[str], dataset_type: str, only_every_nth_slice: int = 1, interpolation: bool = False,
+    def __init__(self, datasets: List[str], dataset_type: str, only_every_nth_slice: int = 1,
+                 interpolation: bool = False,
                  augmentations: callable = None, as_rgb: bool = False,
-                 min_max_normalization: bool = False, sample_shifting: bool = False, plane: str = 'axial'):
+                 sample_shifting: bool = False, plane: str = 'axial'):
         super(TUH_full_scan_dataset, self).__init__()
         self.as_rgb = as_rgb
-        self.min_max_norm = min_max_normalization
+
         self.augmentations = augmentations
         self.nth_slice = only_every_nth_slice
         self.interpolation = interpolation
         self.sample_shifting = sample_shifting
         self.plane = plane
+
+        self.resizer = Resize(spatial_size=512, size_mode="longest")
+        self.padder = DivisiblePad((2, 2))
         # data_path = '/gpfs/space/projects/BetterMedicine/joonas/tuh_kidney_study/new_setup/MIL_EXP/'
         #
         # if dataset_type == "train":
@@ -148,7 +152,7 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
         if not "kits23" in path:
             x = np.flip(x, axis=1)
             x = np.transpose(x, (1, 0, 2))
-        else: #kits is in another orientation
+        else:  # kits is in another orientation
             x = np.transpose(x, (1, 2, 0))
         # this should give the most common axial representation for TUH dataset: (patient on their back)
         if self.plane == "axial":
@@ -163,7 +167,7 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
 
         if not self.sample_shifting:
 
-            if x.shape[2] < 80 and "tuh_kidney" not in path: #take more slices if the scan is small
+            if x.shape[2] < 80 and "tuh_kidney" not in path:  # take more slices if the scan is small
                 x = x[:, :, ::max(int(self.nth_slice - 2), 2)]
             else:
                 x = x[:, :, ::self.nth_slice]
@@ -191,6 +195,12 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
 
         y = torch.tensor(self.labels[index])
 
+        x = torch.permute(x, (2, 0, 1))
+        x = self.resizer(
+            x)  # needed to resize independently from augementations, monai resizer needed channel first tensor
+        x = self.padder(x)
+        x = torch.permute(x, (1, 2, 0))
+
         if self.augmentations is not None:
             for i in range(x.shape[2]):
                 x[:, :, i] = self.augmentations(np.expand_dims(x[:, :, i], 0))
@@ -199,4 +209,5 @@ class TUH_full_scan_dataset(torch.utils.data.Dataset):
             x = torch.stack([x, x, x], dim=0)
             x = torch.squeeze(x)
 
+        x = x.as_tensor()
         return x, y, self.img_paths[index]

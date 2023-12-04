@@ -1,43 +1,54 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import init
 from torchvision.models import resnet18, ResNet18_Weights
 
 
 class ResNet18Attention(nn.Module):
 
-    def __init__(self, neighbour_range = 0):
+    def __init__(self, neighbour_range=0):
         super(ResNet18Attention, self).__init__()
         self.neighbour_range = neighbour_range
-
 
         print("Using neighbour attention with a range of ", self.neighbour_range)
 
         self.L = 512 * 1 * 1
         self.D = 128
         self.K = 1
-        model = resnet18(weights=ResNet18_Weights.DEFAULT)
 
-        # num_input_channel = 1
-        # model.conv1 = nn.Conv2d(num_input_channel, 64, kernel_size=3, stride=1, bias=False)
-        modules = list(model.children())[:-2]
-        self.backbone = nn.Sequential(*modules)
+        def init_weights(m):
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
 
         self.adaptive_pooling = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)))
         # self.pooling = nn.Sequential(nn.Linear(512 * 1 * 1, self.L),
         #                             nn.ReLU())
 
         self.attention = nn.Sequential(
-            nn.Linear(self.L * (1 + self.neighbour_range * 2), self.D),
+            nn.Dropout(0.25),
+            nn.Linear(self.L, self.D),
             nn.Tanh(),
+            nn.Dropout(0.25),
             nn.Linear(self.D, self.K)
         )
+        self.attention.apply(init_weights)
 
         self.classifier = nn.Sequential(
             nn.Linear(self.L * self.K, 1)
             ## nn.Sigmoid()
         )
+        self.classifier.apply(init_weights)
         self.sig = nn.Sigmoid()
+
+        model = resnet18(weights=ResNet18_Weights.DEFAULT)
+
+        # num_input_channel = 1
+        # model.conv1 = nn.Conv2d(num_input_channel, 64, kernel_size=3, stride=1, bias=False)
+        modules = list(model.children())[:-2]
+        self.backbone = nn.Sequential(*modules)
 
     def forward(self, x):
         x = torch.squeeze(x, 0)
@@ -50,10 +61,13 @@ class ResNet18Attention(nn.Module):
 
         if self.neighbour_range != 0:
             combinedH = H.view(-1)
-            combinedH = F.pad(combinedH, (self.L*self.neighbour_range, self.L*self.neighbour_range), "constant", 0)
+            combinedH = F.pad(combinedH, (self.L * self.neighbour_range, self.L * self.neighbour_range), "constant", 0)
             combinedH = combinedH.unfold(0, self.L * (self.neighbour_range * 2 + 1), self.L)
 
-            A = self.attention(combinedH)  # NxK
+            averagedH = 0.25 * combinedH[:, :self.L] + 0.5 * combinedH[:, self.L:2 * self.L] + 0.25 * combinedH[:,
+                                                                                                      2 * self.L:]
+
+            A = self.attention(averagedH)  # NxK
         else:
             A = self.attention(H)  # NxK
 
